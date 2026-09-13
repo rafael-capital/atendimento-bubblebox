@@ -489,6 +489,60 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// Webhook para conexão com o WhatsApp (WAHA)
+app.post('/waha/webhook', async (req, res) => {
+  try {
+    const payload = req.body;
+
+    // Ignorar eventos que não sejam mensagens ou mensagens enviadas por nós mesmos
+    if (payload.event === 'message' && payload.payload && !payload.payload.fromMe) {
+      const clientId = payload.payload.from;
+      const messageBody = payload.payload.body || '';
+
+      console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
+
+      // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
+      res.status(200).send('OK');
+
+      // Processar mensagem apenas se for texto
+      if (messageBody) {
+        const reply = await chat(clientId, messageBody);
+
+        // Se a resposta for null, o transbordo já assumiu. Senão, enviamos a resposta de volta ao WhatsApp.
+        if (reply) {
+          if (process.env.WAHA_API_URL) {
+            await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Api-Key': process.env.WAHA_API_KEY || ''
+              },
+              body: JSON.stringify({
+                chatId: clientId,
+                text: reply,
+                session: process.env.WAHA_SESSION || 'default',
+              }),
+            });
+            console.log(`[WAHA] Reply sent to ${clientId}`);
+          } else {
+            console.log(`[WAHA Simulado] para ${clientId}: ${reply}`);
+          }
+        }
+      }
+      return;
+    }
+
+    // Para outros eventos (typing, status, read) dar OK ignorando
+    res.status(200).send('Event ignored');
+  } catch (err) {
+    console.error('❌ Erro no webhook WAHA:', err);
+    if (!res.headersSent) {
+      res.status(500).send('Error');
+    }
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', agent: 'Super Bubble', timestamp: new Date().toISOString() });
