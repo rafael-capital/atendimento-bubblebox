@@ -1,0 +1,16 @@
+{
+  "name": "atendimento-bubblebox",
+  "version": "1.0.0",
+  "description": "Super Bubble — Agente de IA da Bubble Box Sorocaba",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "openai": "^4.60.0"
+  }
+}
