@@ -108,10 +108,10 @@ Válido para a primeira lavagem ou secagem em qualquer unidade. Oferecer segundo
 
 | Como conheceu | Cupom |
 |---|---|
-| Google | GOOGLE |
-| Instagram ou Facebook | INSTAGRAM |
-| Viu uma unidade na rua | TEVIPORAI |
-| Amigo indicou | AMIGO |
+| Google | ACHEINOGOOGLE |
+| Instagram ou Facebook | ACHEINOINSTA |
+| Viu uma unidade na rua | PASSEINAFRENTE |
+| Amigo indicou | BEMVINDOAMIGO |
 
 ### Cupom Secreto
 Oferecer **apenas** se o cliente perguntar sobre desconto ou promoção:
