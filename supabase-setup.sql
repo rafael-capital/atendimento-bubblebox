@@ -34,3 +34,15 @@ ALTER TABLE mensagens ENABLE ROW LEVEL SECURITY;
 -- Política: permitir tudo via service_role (o servidor usa a chave service role)
 CREATE POLICY "Acesso total via service role" ON conversas FOR ALL USING (true);
 CREATE POLICY "Acesso total via service role" ON mensagens FOR ALL USING (true);
+
+-- =============================================
+-- Origem do lead (adicionado em 2026-09-14)
+-- De onde o cliente conheceu a Bubble Box, para consulta futura.
+-- Execute este bloco no Supabase SQL Editor (é seguro rodar mesmo já
+-- tendo as tabelas criadas — só adiciona colunas novas).
+-- =============================================
+
+ALTER TABLE conversas ADD COLUMN IF NOT EXISTS origem_lead TEXT
+  CHECK (origem_lead IS NULL OR origem_lead IN ('instagram', 'google', 'indicacao', 'passando_na_rua', 'outro'));
+ALTER TABLE conversas ADD COLUMN IF NOT EXISTS origem_lead_detalhe TEXT;
+ALTER TABLE conversas ADD COLUMN IF NOT EXISTS origem_lead_capturada_em TIMESTAMPTZ;

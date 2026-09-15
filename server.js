@@ -231,6 +231,41 @@ async function transferirParaHumano(conversationId, clientId, motivo) {
 }
 
 // ==========================================
+// ORIGEM DO LEAD — de onde o cliente veio
+// ==========================================
+
+async function registrarOrigemLead(conversationId, origem, detalhe) {
+  try {
+    // Não sobrescreve se essa conversa já tiver origem registrada
+    const { data: atual } = await supabase
+      .from('conversas')
+      .select('origem_lead')
+      .eq('id', conversationId)
+      .single();
+
+    if (atual && atual.origem_lead) {
+      return JSON.stringify({ sucesso: true, mensagem: 'Origem já estava registrada, mantendo o valor original.' });
+    }
+
+    const { error } = await supabase
+      .from('conversas')
+      .update({
+        origem_lead: origem,
+        origem_lead_detalhe: detalhe,
+        origem_lead_capturada_em: new Date().toISOString(),
+      })
+      .eq('id', conversationId);
+
+    if (error) throw error;
+
+    return JSON.stringify({ sucesso: true, mensagem: 'Origem do lead registrada.' });
+  } catch (err) {
+    console.error('❌ Erro ao registrar origem do lead:', err.message);
+    return JSON.stringify({ sucesso: false, mensagem: 'Não consegui registrar agora, mas pode seguir a conversa normalmente.' });
+  }
+}
+
+// ==========================================
 // FERRAMENTAS (function calling)
 // ==========================================
 
@@ -272,6 +307,28 @@ const tools = [
   {
     type: 'function',
     function: {
+      name: 'registrar_origem_lead',
+      description: 'Registra de onde o cliente conheceu a Bubble Box (Instagram, Google, indicação, passando na rua ou outro). Use assim que o cliente responder essa pergunta pela primeira vez. Não pergunte de novo se ele já respondeu antes na conversa.',
+      parameters: {
+        type: 'object',
+        properties: {
+          origem: {
+            type: 'string',
+            enum: ['instagram', 'google', 'indicacao', 'passando_na_rua', 'outro'],
+            description: 'Categoria mais próxima da resposta do cliente.',
+          },
+          detalhe: {
+            type: 'string',
+            description: 'A resposta literal do cliente, como ele disse (ex: "vi no Instagram", "minha vizinha indicou").',
+          },
+        },
+        required: ['origem', 'detalhe'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'transferir_humano',
       description: 'Transfere o atendimento para um humano (o Rafael). Use quando: nota fiscal, problema técnico, fechamento de plano, ou qualquer situação fora do seu escopo. A ferramenta pausa o agente, gera um resumo e notifica o Rafael pelo WhatsApp.',
       parameters: {
@@ -298,6 +355,9 @@ async function executeTool(name, args, conversationId, clientId) {
     }
     case 'vmlav_status': {
       return await consultarVMLav(args.unidade);
+    }
+    case 'registrar_origem_lead': {
+      return await registrarOrigemLead(conversationId, args.origem, args.detalhe);
     }
     case 'transferir_humano': {
       return await transferirParaHumano(conversationId, clientId, args.motivo || 'não especificado');
@@ -381,10 +441,24 @@ async function chat(clientId, userMessage) {
     return 'Desculpe, estou com um problema técnico. Tente novamente em instantes.';
   }
 
-  // 1b. Se a conversa está no modo humano, o agente não responde
+  // 1b. Se a conversa está no modo humano, o agente não responde (ou verifica timeout)
   if (conversation.status === 'humano') {
-    await saveMessage(conversation.id, 'user', userMessage);
-    return null; // null = não responder (o humano está no controle)
+    const lastUpdate = new Date(conversation.updated_at);
+    const now = new Date();
+    const diffHours = (now - lastUpdate) / (1000 * 60 * 60);
+
+    if (diffHours >= 4) {
+      console.log(`[TIMEOUT] Retornando conversa do ${clientId} para o agente após 4 horas.`);
+      await supabase
+        .from('conversas')
+        .update({ status: 'agente', updated_at: now.toISOString() })
+        .eq('id', conversation.id);
+      conversation.status = 'agente'; // Permite o agente responder agora
+    } else {
+      await saveMessage(conversation.id, 'user', userMessage);
+      await touchConversation(conversation.id); // Renova o timeout se o cliente mandar msg
+      return null; // null = não responder (o humano está no controle)
+    }
   }
 
   // 2. Salvar a mensagem do cliente
@@ -494,8 +568,36 @@ app.post('/waha/webhook', async (req, res) => {
   try {
     const payload = req.body;
 
-    // Ignorar eventos que não sejam mensagens ou mensagens enviadas por nós mesmos
-    if (payload.event === 'message' && payload.payload && !payload.payload.fromMe) {
+    // Ignorar eventos que não sejam mensagens
+    if (payload.event === 'message' && payload.payload) {
+      // 1. Mensagens enviadas PELO HUMANO (Rafael) via próprio celular ou Chatwoot
+      if (payload.payload.fromMe) {
+        const clientId = payload.payload.to; // O destino da msg é o cliente
+        const messageBody = payload.payload.body || '';
+
+        // Se o humano mandar a mensagem de encerramento, religa o agente
+        if (messageBody.includes('Bubble Lover, vou encerrar o seu atendimento')) {
+          console.log(`[WAHA] Comando de devolução detectado para ${clientId}. Reativando agente...`);
+
+          await supabase
+            .from('conversas')
+            .update({ status: 'agente', updated_at: new Date().toISOString() })
+            .eq('client_id', clientId);
+
+          console.log(`[WAHA] Agente reativado para ${clientId}`);
+        } else {
+          // Renova o timeout se o humano mandar mensagem
+          await supabase
+            .from('conversas')
+            .update({ updated_at: new Date().toISOString() })
+            .eq('client_id', clientId);
+        }
+
+        // Retornamos OK e não deixamos o agente responder (pois fomos nós que geramos)
+        return res.status(200).send('OK');
+      }
+
+      // 2. Mensagens enviadas PELO CLIENTE (fromMe: false)
       const clientId = payload.payload.from;
       const messageBody = payload.payload.body || '';
 
