@@ -617,9 +617,9 @@ app.post('/waha/webhook', async (req, res) => {
 
       // Se for midia sem texto, responder com mensagem amigavel e encerrar
       if (hasMedia && !messageBody) {
-        const mediaReply = 'Oi, Bubble Lover! No momento eu so consigo ler mensagens em texto. Pode me escrever o que precisa? Estou aqui para ajudar!';
+        const mediaReply = 'Oi, Bubble Lover! No momento eu so consigo ler mensagens em texto. Pode me escrever o que precisa?';
         if (process.env.WAHA_API_URL) {
-          await fetch(`\/api/sendText`, {
+          await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -632,7 +632,7 @@ app.post('/waha/webhook', async (req, res) => {
               session: process.env.WAHA_SESSION || 'default',
             }),
           });
-          console.log(`[WAHA] Reply sent to \ (media fallback)`);
+          console.log(`[WAHA] Reply sent to ${clientId} (media fallback)`);
         }
         return;
       }
@@ -645,7 +645,7 @@ app.post('/waha/webhook', async (req, res) => {
           // Se a resposta for null, o transbordo ja assumiu. Senao, enviamos a resposta de volta ao WhatsApp.
           if (reply) {
             if (process.env.WAHA_API_URL) {
-              await fetch(`\/api/sendText`, {
+              await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -658,16 +658,16 @@ app.post('/waha/webhook', async (req, res) => {
                   session: process.env.WAHA_SESSION || 'default',
                 }),
               });
-              console.log(`[WAHA] Reply sent to \`);
+              console.log(`[WAHA] Reply sent to ${clientId}`);
             } else {
-              console.log(`[WAHA Simulado] para \: \`);
+              console.log(`[WAHA Simulado] para ${clientId}: ${reply}`);
             }
           }
         } catch (chatErr) {
-          console.error(`Erro no chat para \:`, chatErr.message);
+          console.error(`Erro no chat para ${clientId}:`, chatErr.message);
           if (process.env.WAHA_API_URL) {
             try {
-              await fetch(`\/api/sendText`, {
+              await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
