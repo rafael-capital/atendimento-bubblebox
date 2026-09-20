@@ -599,36 +599,90 @@ app.post('/waha/webhook', async (req, res) => {
 
       // 2. Mensagens enviadas PELO CLIENTE (fromMe: false)
       const clientId = payload.payload.from;
-      const messageBody = payload.payload.body || '';
+      const messageBody = (payload.payload.body || '').substring(0, 2000);
 
       console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
 
       // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
       res.status(200).send('OK');
 
-      // Processar mensagem apenas se for texto
-      if (messageBody) {
-        const reply = await chat(clientId, messageBody);
+      // Detectar se a mensagem e midia (imagem, audio, video, etc.)
+      const hasMedia = payload.payload.hasMedia ||
+        payload.payload.type === 'image' ||
+        payload.payload.type === 'audio' ||
+        payload.payload.type === 'ptt' ||
+        payload.payload.type === 'video' ||
+        payload.payload.type === 'document' ||
+        payload.payload.type === 'sticker';
 
-        // Se a resposta for null, o transbordo já assumiu. Senão, enviamos a resposta de volta ao WhatsApp.
-        if (reply) {
+      // Se for midia sem texto, responder com mensagem amigavel e encerrar
+      if (hasMedia && !messageBody) {
+        const mediaReply = 'Oi, Bubble Lover! No momento eu so consigo ler mensagens em texto. Pode me escrever o que precisa? Estou aqui para ajudar!';
+        if (process.env.WAHA_API_URL) {
+          await fetch(`\/api/sendText`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              'X-Api-Key': process.env.WAHA_API_KEY || ''
+            },
+            body: JSON.stringify({
+              chatId: clientId,
+              text: mediaReply,
+              session: process.env.WAHA_SESSION || 'default',
+            }),
+          });
+          console.log(`[WAHA] Reply sent to \ (media fallback)`);
+        }
+        return;
+      }
+
+      // Processar mensagem apenas se tiver texto
+      if (messageBody) {
+        try {
+          const reply = await chat(clientId, messageBody);
+
+          // Se a resposta for null, o transbordo ja assumiu. Senao, enviamos a resposta de volta ao WhatsApp.
+          if (reply) {
+            if (process.env.WAHA_API_URL) {
+              await fetch(`\/api/sendText`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json',
+                  'X-Api-Key': process.env.WAHA_API_KEY || ''
+                },
+                body: JSON.stringify({
+                  chatId: clientId,
+                  text: reply,
+                  session: process.env.WAHA_SESSION || 'default',
+                }),
+              });
+              console.log(`[WAHA] Reply sent to \`);
+            } else {
+              console.log(`[WAHA Simulado] para \: \`);
+            }
+          }
+        } catch (chatErr) {
+          console.error(`Erro no chat para \:`, chatErr.message);
           if (process.env.WAHA_API_URL) {
-            await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Accept: 'application/json',
-                'X-Api-Key': process.env.WAHA_API_KEY || ''
-              },
-              body: JSON.stringify({
-                chatId: clientId,
-                text: reply,
-                session: process.env.WAHA_SESSION || 'default',
-              }),
-            });
-            console.log(`[WAHA] Reply sent to ${clientId}`);
-          } else {
-            console.log(`[WAHA Simulado] para ${clientId}: ${reply}`);
+            try {
+              await fetch(`\/api/sendText`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json',
+                  'X-Api-Key': process.env.WAHA_API_KEY || ''
+                },
+                body: JSON.stringify({
+                  chatId: clientId,
+                  text: 'Desculpe, tive um problema tecnico momentaneo. Pode repetir sua mensagem?',
+                  session: process.env.WAHA_SESSION || 'default',
+                }),
+              });
+            } catch (sendErr) {
+              console.error('Erro ao enviar fallback:', sendErr.message);
+            }
           }
         }
       }
