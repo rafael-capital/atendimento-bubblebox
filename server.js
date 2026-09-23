@@ -26,7 +26,7 @@ const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 // Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
 // max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
 const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
-const VERSAO = '2026-09-23-sonnet5';
+const VERSAO = '2026-09-23-checkin';
 
 // Supabase (memória)
 const supabase = createClient(
@@ -608,6 +608,11 @@ app.post('/waha/webhook', async (req, res) => {
       const clientId = payload.payload.from;
       const messageBody = (payload.payload.body || '').substring(0, 2000);
 
+      // Status do WhatsApp, grupos e canais não são clientes: o agente não responde
+      if (/(@broadcast|@g\.us|@newsletter)$/.test(String(clientId))) {
+        return res.status(200).send('OK');
+      }
+
       console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
 
       // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
@@ -703,6 +708,52 @@ app.post('/waha/webhook', async (req, res) => {
     if (!res.headersSent) {
       res.status(500).send('Error');
     }
+  }
+});
+
+// ==========================================
+// CHECK-IN DO PRIMEIRO CICLO (chamado pelo n8n)
+// ==========================================
+// O n8n detecta na VMLav o primeiro ciclo de um cliente e chama esta rota com a
+// mensagem já sorteada. O WhatsApp identifica os clientes por um código interno
+// (@lid), não pelo telefone — e é com esse código que a resposta do cliente volta.
+// Por isso a conversa é gravada no @lid: quando ele responder, o agente enxerga
+// a pergunta no histórico e segue (link de avaliação ou transferência).
+app.post('/checkin', async (req, res) => {
+  if (!process.env.CHECKIN_TOKEN || req.get('x-checkin-token') !== process.env.CHECKIN_TOKEN) {
+    return res.status(401).json({ enviado: false, motivo: 'não autorizado' });
+  }
+  const { telefone, mensagem } = req.body || {};
+  const digitos = String(telefone || '').replace(/\D/g, '');
+  if (!mensagem || digitos.length < 10) {
+    return res.status(400).json({ enviado: false, motivo: 'telefone ou mensagem inválidos' });
+  }
+  const numero = digitos.startsWith('55') && digitos.length >= 12 ? digitos : `55${digitos}`;
+  const sessao = process.env.WAHA_SESSION || 'default';
+  const headers = { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' };
+
+  try {
+    const r = await fetch(`${process.env.WAHA_API_URL}/api/contacts/check-exists?phone=${numero}&session=${encodeURIComponent(sessao)}`, { headers });
+    const contato = await r.json();
+    if (!contato.numberExists || !contato.chatId) return res.json({ enviado: false, motivo: 'telefone sem WhatsApp' });
+
+    const conversa = await getOrCreateConversation(contato.chatId);
+    if (!conversa) return res.status(500).json({ enviado: false, motivo: 'não consegui abrir a conversa' });
+    if (conversa.status === 'humano') return res.json({ enviado: false, motivo: 'cliente em atendimento humano' });
+
+    const envio = await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ session: sessao, chatId: contato.chatId, text: mensagem }),
+    });
+    if (!envio.ok) return res.status(502).json({ enviado: false, motivo: `WAHA recusou o envio (${envio.status})` });
+
+    await saveMessage(conversa.id, 'assistant', mensagem);
+    console.log(`📨 Check-in de primeiro ciclo enviado para ${contato.chatId}`);
+    res.json({ enviado: true });
+  } catch (err) {
+    console.error('❌ Erro no check-in:', err);
+    res.status(500).json({ enviado: false, motivo: err.message });
   }
 });
 
