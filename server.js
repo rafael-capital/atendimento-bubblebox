@@ -613,6 +613,15 @@ app.post('/waha/webhook', async (req, res) => {
         return res.status(200).send('OK');
       }
 
+      // Comandos do dono (PAUSAR / RETOMAR / STATUS CHECKIN), vindos do WhatsApp do Rafael
+      const comando = comandoCheckin(messageBody);
+      if (comando && await ehODono(clientId)) {
+        res.status(200).send('OK');
+        const resposta = await controlarCheckin(comando);
+        await enviarWhatsApp(clientId, resposta);
+        return;
+      }
+
       console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
 
       // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
@@ -710,6 +719,67 @@ app.post('/waha/webhook', async (req, res) => {
     }
   }
 });
+
+// ==========================================
+// CONTROLE DO CHECK-IN PELO WHATSAPP DO DONO
+// ==========================================
+// O Rafael manda "PAUSAR CHECKIN", "RETOMAR CHECKIN" ou "STATUS CHECKIN" do celular dele
+// para o WhatsApp da Bubble Box. A fila e o interruptor vivem no n8n (memória do fluxo),
+// então aqui só repassamos o comando e devolvemos a resposta para ele.
+const DONO_TELEFONE = process.env.RAFAEL_PHONE && process.env.RAFAEL_PHONE !== '5515999999999'
+  ? process.env.RAFAEL_PHONE : '5515981764442';
+const N8N_CHECKIN_CONTROLE = 'https://auto.prosa.app.br/webhook/checkin-controle';
+let donoLid = null;
+
+function comandoCheckin(texto) {
+  const t = String(texto || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toUpperCase().replace(/[^A-Z ]/g, ' ').replace(/\s+/g, ' ').trim().replace('CHECK IN', 'CHECKIN');
+  const m = t.match(/^(PAUSAR|RETOMAR|STATUS) CHECKIN$/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Os clientes chegam como código interno (@lid); descobrimos o código do Rafael no WAHA uma vez
+async function ehODono(clientId) {
+  if (clientId === `${DONO_TELEFONE}@c.us`) return true;
+  if (!donoLid && process.env.WAHA_API_URL) {
+    try {
+      const sessao = encodeURIComponent(process.env.WAHA_SESSION || 'default');
+      const r = await fetch(`${process.env.WAHA_API_URL}/api/${sessao}/lids/pn/${DONO_TELEFONE}`, {
+        headers: { Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' },
+      });
+      donoLid = (await r.json()).lid || null;
+    } catch (err) {
+      console.error('⚠️  Não consegui descobrir o código do WhatsApp do Rafael:', err.message);
+    }
+  }
+  return !!donoLid && clientId === donoLid;
+}
+
+async function controlarCheckin(acao) {
+  try {
+    const r = await fetch(N8N_CHECKIN_CONTROLE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-checkin-token': process.env.CHECKIN_TOKEN || '' },
+      body: JSON.stringify({ acao }),
+    });
+    if (!r.ok) throw new Error(`n8n respondeu ${r.status}`);
+    const s = await r.json();
+    const situacao = s.pausado ? '⏸️ *Check-ins PAUSADOS*' : '▶️ *Check-ins ATIVOS*';
+    return `${situacao}\n📋 Na fila: ${s.fila}\n📨 Enviados hoje: ${s.enviadosHoje} de ${s.limite}`;
+  } catch (err) {
+    console.error('❌ Erro ao controlar check-in:', err.message);
+    return '⚠️ Não consegui falar com a automação de check-in agora. Tente de novo em alguns minutos.';
+  }
+}
+
+async function enviarWhatsApp(chatId, text) {
+  if (!process.env.WAHA_API_URL) return console.log(`[WAHA Simulado] para ${chatId}: ${text}`);
+  await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' },
+    body: JSON.stringify({ session: process.env.WAHA_SESSION || 'default', chatId, text }),
+  });
+}
 
 // ==========================================
 // CHECK-IN DO PRIMEIRO CICLO (chamado pelo n8n)
