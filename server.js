@@ -23,6 +23,11 @@ const openai = new OpenAI({
 
 const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 
+// Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
+// max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
+const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
+const VERSAO = '2026-09-23-sonnet5';
+
 // Supabase (memória)
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -153,6 +158,7 @@ async function gerarResumoConversa(mensagens) {
 
     const response = await openai.chat.completions.create({
       model: AI_MODEL,
+      ...AI_EXTRA,
       messages: [
         {
           role: 'system',
@@ -485,6 +491,7 @@ async function chat(clientId, userMessage) {
 
     response = await openai.chat.completions.create({
       model: AI_MODEL,
+      ...AI_EXTRA,
       messages: messages,
       tools: tools,
       tool_choice: 'auto',
@@ -701,7 +708,7 @@ app.post('/waha/webhook', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', agent: 'Super Bubble', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', agent: 'Super Bubble', versao: VERSAO, modelo: AI_MODEL, timestamp: new Date().toISOString() });
 });
 
 // ==========================================
