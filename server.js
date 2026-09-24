@@ -26,7 +26,7 @@ const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 // Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
 // max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
 const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
-const VERSAO = '2026-09-23-checkin';
+const VERSAO = '2026-09-23-historico';
 
 // Supabase (memória)
 const supabase = createClient(
@@ -412,20 +412,23 @@ async function saveMessage(conversationId, role, content) {
   if (error) console.error('Erro ao salvar mensagem:', error);
 }
 
-// Carregar as últimas N mensagens de uma conversa
+// Carregar as últimas N mensagens de uma conversa (busca as mais novas e devolve em ordem
+// cronológica). Antes buscava as N mais ANTIGAS: em conversa com mais de N mensagens o
+// agente respondia sem ver a mensagem atual — e o Sonnet 5 recusa (histórico terminando
+// em mensagem do assistente), o que virava "tive um problema técnico".
 async function loadMessages(conversationId, limit = 20) {
   const { data, error } = await supabase
     .from('mensagens')
     .select('role, content, created_at')
     .eq('conversa_id', conversationId)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit(limit);
 
   if (error) {
     console.error('Erro ao carregar mensagens:', error);
     return [];
   }
-  return data || [];
+  return (data || []).reverse();
 }
 
 // Atualizar timestamp da conversa
