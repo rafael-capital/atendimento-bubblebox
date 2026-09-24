@@ -26,7 +26,7 @@ const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 // Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
 // max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
 const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
-const VERSAO = '2026-09-23-historico';
+const VERSAO = '2026-09-24-dono-assume';
 
 // Supabase (memória)
 const supabase = createClient(
@@ -153,7 +153,7 @@ const RAFAEL_PHONE = process.env.RAFAEL_PHONE || '5515999999999';
 async function gerarResumoConversa(mensagens) {
   try {
     const historicoTexto = mensagens
-      .map((m) => `${m.role === 'user' ? 'Cliente' : 'Super Bubble'}: ${m.content}`)
+      .map((m) => `${{ user: 'Cliente', humano: 'Rafael' }[m.role] || 'Super Bubble'}: ${m.content}`)
       .join('\n');
 
     const response = await openai.chat.completions.create({
@@ -185,15 +185,7 @@ async function notificarRafael(clientId, resumo, motivo) {
   // Se o WAHA estiver configurado, envia pelo WhatsApp
   if (process.env.WAHA_API_URL) {
     try {
-      await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.WAHA_API_KEY || '' },
-        body: JSON.stringify({
-          chatId: `${RAFAEL_PHONE}@c.us`,
-          text: mensagem,
-          session: process.env.WAHA_SESSION || 'default',
-        }),
-      });
+      await enviarWhatsApp(`${RAFAEL_PHONE}@c.us`, mensagem);
       console.log(`📲 Notificação WhatsApp enviada para ${RAFAEL_PHONE}`);
     } catch (err) {
       console.error('⚠️  Erro ao enviar notificação WhatsApp:', err.message);
@@ -450,24 +442,13 @@ async function chat(clientId, userMessage) {
     return 'Desculpe, estou com um problema técnico. Tente novamente em instantes.';
   }
 
-  // 1b. Se a conversa está no modo humano, o agente não responde (ou verifica timeout)
+  // 1b. Conversa com o Rafael: o agente só registra e fica quieto. Não há volta automática
+  // por tempo (decisão de 24/09) — o agente só volta quando o Rafael manda a frase de
+  // devolução (FRASE_DEVOLUCAO), tratada no webhook.
   if (conversation.status === 'humano') {
-    const lastUpdate = new Date(conversation.updated_at);
-    const now = new Date();
-    const diffHours = (now - lastUpdate) / (1000 * 60 * 60);
-
-    if (diffHours >= 4) {
-      console.log(`[TIMEOUT] Retornando conversa do ${clientId} para o agente após 4 horas.`);
-      await supabase
-        .from('conversas')
-        .update({ status: 'agente', updated_at: now.toISOString() })
-        .eq('id', conversation.id);
-      conversation.status = 'agente'; // Permite o agente responder agora
-    } else {
-      await saveMessage(conversation.id, 'user', userMessage);
-      await touchConversation(conversation.id); // Renova o timeout se o cliente mandar msg
-      return null; // null = não responder (o humano está no controle)
-    }
+    await saveMessage(conversation.id, 'user', userMessage);
+    await touchConversation(conversation.id);
+    return null; // null = não responder (o humano está no controle)
   }
 
   // 2. Salvar a mensagem do cliente
@@ -574,147 +555,68 @@ app.post('/chat', async (req, res) => {
 });
 
 // Webhook para conexão com o WhatsApp (WAHA)
+// A sessão do WAHA precisa assinar o evento "message.any": é ele que avisa também das
+// mensagens que SAEM do número da Bubble Box (fromMe) — as do agente e as do Rafael.
+// O evento "message" (só as recebidas) continua aceito para não quebrar na transição.
 app.post('/waha/webhook', async (req, res) => {
   try {
     const payload = req.body;
+    const p = payload.payload;
 
     // Ignorar eventos que não sejam mensagens
-    if (payload.event === 'message' && payload.payload) {
-      // 1. Mensagens enviadas PELO HUMANO (Rafael) via próprio celular ou Chatwoot
-      if (payload.payload.fromMe) {
-        const clientId = payload.payload.to; // O destino da msg é o cliente
-        const messageBody = payload.payload.body || '';
+    if (!['message', 'message.any'].includes(payload.event) || !p) {
+      return res.status(200).send('Event ignored');
+    }
 
-        // Se o humano mandar a mensagem de encerramento, religa o agente
-        if (messageBody.includes('Bubble Lover, vou encerrar o seu atendimento')) {
-          console.log(`[WAHA] Comando de devolução detectado para ${clientId}. Reativando agente...`);
+    // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
+    res.status(200).send('OK');
 
-          await supabase
-            .from('conversas')
-            .update({ status: 'agente', updated_at: new Date().toISOString() })
-            .eq('client_id', clientId);
+    const naoECliente = (id) => /(@broadcast|@g\.us|@newsletter)$/.test(String(id));
 
-          console.log(`[WAHA] Agente reativado para ${clientId}`);
-        } else {
-          // Renova o timeout se o humano mandar mensagem
-          await supabase
-            .from('conversas')
-            .update({ updated_at: new Date().toISOString() })
-            .eq('client_id', clientId);
-        }
-
-        // Retornamos OK e não deixamos o agente responder (pois fomos nós que geramos)
-        return res.status(200).send('OK');
-      }
-
-      // 2. Mensagens enviadas PELO CLIENTE (fromMe: false)
-      const clientId = payload.payload.from;
-      const messageBody = (payload.payload.body || '').substring(0, 2000);
-
-      // Status do WhatsApp, grupos e canais não são clientes: o agente não responde
-      if (/(@broadcast|@g\.us|@newsletter)$/.test(String(clientId))) {
-        return res.status(200).send('OK');
-      }
-
-      // Comandos do dono (PAUSAR / RETOMAR / STATUS CHECKIN), vindos do WhatsApp do Rafael
-      const comando = comandoCheckin(messageBody);
-      if (comando && await ehODono(clientId)) {
-        res.status(200).send('OK');
-        const resposta = await controlarCheckin(comando);
-        await enviarWhatsApp(clientId, resposta);
-        return;
-      }
-
-      console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
-
-      // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
-      res.status(200).send('OK');
-
-      // Detectar se a mensagem e midia (imagem, audio, video, etc.)
-      const hasMedia = payload.payload.hasMedia ||
-        payload.payload.type === 'image' ||
-        payload.payload.type === 'audio' ||
-        payload.payload.type === 'ptt' ||
-        payload.payload.type === 'video' ||
-        payload.payload.type === 'document' ||
-        payload.payload.type === 'sticker';
-
-      // Se for midia sem texto, responder com mensagem amigavel e encerrar
-      if (hasMedia && !messageBody) {
-        const mediaReply = 'Oi, Bubble Lover! No momento eu so consigo ler mensagens em texto. Pode me escrever o que precisa?';
-        if (process.env.WAHA_API_URL) {
-          await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Accept: 'application/json',
-              'X-Api-Key': process.env.WAHA_API_KEY || ''
-            },
-            body: JSON.stringify({
-              chatId: clientId,
-              text: mediaReply,
-              session: process.env.WAHA_SESSION || 'default',
-            }),
-          });
-          console.log(`[WAHA] Reply sent to ${clientId} (media fallback)`);
-        }
-        return;
-      }
-
-      // Processar mensagem apenas se tiver texto
-      if (messageBody) {
-        try {
-          const reply = await chat(clientId, messageBody);
-
-          // Se a resposta for null, o transbordo ja assumiu. Senao, enviamos a resposta de volta ao WhatsApp.
-          if (reply) {
-            if (process.env.WAHA_API_URL) {
-              await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Accept: 'application/json',
-                  'X-Api-Key': process.env.WAHA_API_KEY || ''
-                },
-                body: JSON.stringify({
-                  chatId: clientId,
-                  text: reply,
-                  session: process.env.WAHA_SESSION || 'default',
-                }),
-              });
-              console.log(`[WAHA] Reply sent to ${clientId}`);
-            } else {
-              console.log(`[WAHA Simulado] para ${clientId}: ${reply}`);
-            }
-          }
-        } catch (chatErr) {
-          console.error(`Erro no chat para ${clientId}:`, chatErr.message);
-          if (process.env.WAHA_API_URL) {
-            try {
-              await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Accept: 'application/json',
-                  'X-Api-Key': process.env.WAHA_API_KEY || ''
-                },
-                body: JSON.stringify({
-                  chatId: clientId,
-                  text: 'Desculpe, tive um problema tecnico momentaneo. Pode repetir sua mensagem?',
-                  session: process.env.WAHA_SESSION || 'default',
-                }),
-              });
-            } catch (sendErr) {
-              console.error('Erro ao enviar fallback:', sendErr.message);
-            }
-          }
-        }
-      }
+    // 1. Mensagens que SAÍRAM do número da Bubble Box
+    if (p.fromMe) {
+      const texto = p.body || '';
+      if (foiOAgente(texto)) return; // o próprio agente (ou o check-in) que mandou
+      if (naoECliente(p.to) || await ehODono(p.to)) return;
+      await rafaelRespondeu(await idDoCliente(p.to), texto);
       return;
     }
 
-    // Para outros eventos (typing, status, read) dar OK ignorando
-    res.status(200).send('Event ignored');
+    // 2. Mensagens enviadas PELO CLIENTE
+    const clientId = p.from;
+    const messageBody = (p.body || '').substring(0, 2000);
+
+    // Status do WhatsApp, grupos e canais não são clientes: o agente não responde
+    if (naoECliente(clientId)) return;
+
+    // Comandos do dono (PAUSAR / RETOMAR / STATUS CHECKIN), vindos do WhatsApp do Rafael
+    const comando = comandoCheckin(messageBody);
+    if (comando && await ehODono(clientId)) {
+      await enviarWhatsApp(clientId, await controlarCheckin(comando));
+      return;
+    }
+
+    console.log(`[WAHA] Message from ${clientId}: ${messageBody}`);
+
+    // Detectar se a mensagem e midia (imagem, audio, video, etc.)
+    const hasMedia = p.hasMedia ||
+      ['image', 'audio', 'ptt', 'video', 'document', 'sticker'].includes(p.type);
+
+    // Mídia sem texto: com o Rafael no controle, só registra (ele vê no celular);
+    // com o agente, avisa que ele só lê texto
+    if (hasMedia && !messageBody) {
+      const conversa = await getOrCreateConversation(clientId);
+      if (conversa && conversa.status === 'humano') {
+        await saveMessage(conversa.id, 'user', `[cliente enviou ${p.type || 'mídia'}]`);
+        await touchConversation(conversa.id);
+        return;
+      }
+      await enviarWhatsApp(clientId, 'Oi, Bubble Lover! No momento eu so consigo ler mensagens em texto. Pode me escrever o que precisa?');
+      console.log(`[WAHA] Reply sent to ${clientId} (media fallback)`);
+      return;
+    }
+
+    if (messageBody) receberDoCliente(clientId, messageBody);
   } catch (err) {
     console.error('❌ Erro no webhook WAHA:', err);
     if (!res.headersSent) {
@@ -722,6 +624,102 @@ app.post('/waha/webhook', async (req, res) => {
     }
   }
 });
+
+// ==========================================
+// RAFAEL ASSUME A CONVERSA
+// ==========================================
+// Regra de 24/09: se o Rafael responde um cliente pelo celular, o agente sai daquela
+// conversa e só volta quando o Rafael manda a frase padrão de devolução. A mensagem dele
+// fica no histórico, para o agente saber o que foi combinado quando voltar.
+const FRASE_DEVOLUCAO = 'vou encerrar o seu atendimento';
+
+function semAcento(t) {
+  return String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+async function rafaelRespondeu(clientId, texto) {
+  const conversa = await getOrCreateConversation(clientId);
+  if (!conversa) return;
+  const devolve = semAcento(texto).includes(FRASE_DEVOLUCAO);
+
+  await saveMessage(conversa.id, 'humano', texto || '[Rafael enviou uma mídia]');
+  await supabase
+    .from('conversas')
+    .update({ status: devolve ? 'agente' : 'humano', updated_at: new Date().toISOString() })
+    .eq('id', conversa.id);
+
+  if (devolve) console.log(`[WAHA] Rafael devolveu ${clientId} para o agente`);
+  else if (conversa.status !== 'humano') console.log(`[WAHA] Rafael assumiu ${clientId} — agente pausado nessa conversa`);
+}
+
+// Mensagem digitada no celular pode chegar com o telefone (@c.us), mas a conversa do
+// cliente está gravada no código interno (@lid) — traduzimos pelo WAHA
+async function idDoCliente(chatId) {
+  const m = String(chatId).match(/^(\d+)@c\.us$/);
+  if (!m || !process.env.WAHA_API_URL) return chatId;
+  try {
+    const sessao = encodeURIComponent(process.env.WAHA_SESSION || 'default');
+    const r = await fetch(`${process.env.WAHA_API_URL}/api/${sessao}/lids/pn/${m[1]}`, {
+      headers: { Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' },
+    });
+    return (await r.json()).lid || chatId;
+  } catch (err) {
+    console.error('⚠️  Não consegui traduzir o contato para @lid:', err.message);
+    return chatId;
+  }
+}
+
+// ==========================================
+// JUNTAR MENSAGENS SEGUIDAS DO CLIENTE
+// ==========================================
+// Cliente costuma mandar várias mensagens seguidas ("Cara é verdade" / "esqueci"). Esperamos
+// ele parar de digitar e respondemos tudo de uma vez — antes saía uma resposta para cada.
+// Enquanto o agente responde, o que chegar fica guardado para a rodada seguinte.
+const ESPERA_CLIENTE_MS = 8000;
+const filas = new Map(); // clientId -> { textos, timer, ocupado }
+
+function receberDoCliente(clientId, texto) {
+  let f = filas.get(clientId);
+  if (!f) filas.set(clientId, (f = { textos: [], timer: null, ocupado: false }));
+  f.textos.push(texto);
+  clearTimeout(f.timer);
+  f.timer = setTimeout(() => processarFila(clientId), ESPERA_CLIENTE_MS);
+}
+
+async function processarFila(clientId) {
+  const f = filas.get(clientId);
+  if (!f || f.ocupado || !f.textos.length) return; // ocupado: reprocessa ao terminar
+  f.ocupado = true;
+  try {
+    await responderCliente(clientId, f.textos.splice(0).join('\n'));
+  } finally {
+    f.ocupado = false;
+    if (f.textos.length) {
+      clearTimeout(f.timer);
+      f.timer = setTimeout(() => processarFila(clientId), ESPERA_CLIENTE_MS);
+    } else {
+      filas.delete(clientId);
+    }
+  }
+}
+
+async function responderCliente(clientId, texto) {
+  try {
+    const reply = await chat(clientId, texto);
+    // Se a resposta for null, o Rafael está no controle
+    if (reply) {
+      await enviarWhatsApp(clientId, reply);
+      console.log(`[WAHA] Reply sent to ${clientId}`);
+    }
+  } catch (chatErr) {
+    console.error(`Erro no chat para ${clientId}:`, chatErr.message);
+    try {
+      await enviarWhatsApp(clientId, 'Desculpe, tive um problema tecnico momentaneo. Pode repetir sua mensagem?');
+    } catch (sendErr) {
+      console.error('Erro ao enviar fallback:', sendErr.message);
+    }
+  }
+}
 
 // ==========================================
 // CONTROLE DO CHECK-IN PELO WHATSAPP DO DONO
@@ -775,9 +773,24 @@ async function controlarCheckin(acao) {
   }
 }
 
+// O WhatsApp avisa de volta toda mensagem que sai do número (fromMe). Anotamos o que o
+// agente enviou ANTES de enviar (o aviso pode chegar antes da resposta do WAHA): o que
+// sair do número e não estiver aqui foi digitado pelo Rafael.
+const enviadasPeloAgente = new Map(); // texto -> expira em (ms)
+const chaveTexto = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+
+function foiOAgente(texto) {
+  const expira = enviadasPeloAgente.get(chaveTexto(texto));
+  return !!expira && expira > Date.now();
+}
+
 async function enviarWhatsApp(chatId, text) {
+  text = String(text).replace(/\*\*(.+?)\*\*/g, '*$1*'); // negrito do WhatsApp é com 1 asterisco
+  const agora = Date.now();
+  for (const [k, expira] of enviadasPeloAgente) if (expira < agora) enviadasPeloAgente.delete(k);
+  enviadasPeloAgente.set(chaveTexto(text), agora + 10 * 60 * 1000);
   if (!process.env.WAHA_API_URL) return console.log(`[WAHA Simulado] para ${chatId}: ${text}`);
-  await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
+  return fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' },
     body: JSON.stringify({ session: process.env.WAHA_SESSION || 'default', chatId, text }),
@@ -814,11 +827,7 @@ app.post('/checkin', async (req, res) => {
     if (!conversa) return res.status(500).json({ enviado: false, motivo: 'não consegui abrir a conversa' });
     if (conversa.status === 'humano') return res.json({ enviado: false, motivo: 'cliente em atendimento humano' });
 
-    const envio = await fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ session: sessao, chatId: contato.chatId, text: mensagem }),
-    });
+    const envio = await enviarWhatsApp(contato.chatId, mensagem);
     if (!envio.ok) return res.status(502).json({ enviado: false, motivo: `WAHA recusou o envio (${envio.status})` });
 
     await saveMessage(conversa.id, 'assistant', mensagem);
