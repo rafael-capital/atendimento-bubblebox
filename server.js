@@ -26,7 +26,7 @@ const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 // Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
 // max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
 const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
-const VERSAO = '2026-09-24-dono-assume';
+const VERSAO = '2026-10-01-painel';
 
 // Supabase (memória)
 const supabase = createClient(
@@ -185,7 +185,7 @@ async function notificarRafael(clientId, resumo, motivo) {
   // Se o WAHA estiver configurado, envia pelo WhatsApp
   if (process.env.WAHA_API_URL) {
     try {
-      await enviarWhatsApp(`${RAFAEL_PHONE}@c.us`, mensagem);
+      await enviarWhatsApp(`${RAFAEL_PHONE}@c.us`, mensagem, { ignorarControle: true });
       console.log(`📲 Notificação WhatsApp enviada para ${RAFAEL_PHONE}`);
     } catch (err) {
       console.error('⚠️  Erro ao enviar notificação WhatsApp:', err.message);
@@ -207,6 +207,10 @@ async function transferirParaHumano(conversationId, clientId, motivo) {
       .from('conversas')
       .update({ status: 'humano', updated_at: new Date().toISOString() })
       .eq('id', conversationId);
+
+    // 1b. Avisar o painel: a conversa vai pra equipe (e a despedida do agente ainda pode sair)
+    transferidasAgora.add(clientId);
+    await painelControle(clientId, 'humano', motivo);
 
     // 2. Carregar histórico e gerar resumo
     const mensagens = await loadMessages(conversationId, 20);
@@ -442,6 +446,8 @@ async function chat(clientId, userMessage) {
     return 'Desculpe, estou com um problema técnico. Tente novamente em instantes.';
   }
 
+  await sincronizarComPainel(conversation, clientId);
+
   // 1b. Conversa com o Rafael: o agente só registra e fica quieto. Não há volta automática
   // por tempo (decisão de 24/09) — o agente só volta quando o Rafael manda a frase de
   // devolução (FRASE_DEVOLUCAO), tratada no webhook.
@@ -571,6 +577,10 @@ app.post('/waha/webhook', async (req, res) => {
     // Resposta ao WAHA imediata para confirmar recebimento (evitar retries)
     res.status(200).send('OK');
 
+    // Só a sessão configurada: na troca de WAHA, o antigo pode continuar ligado no mesmo número
+    // (ex.: avisos do n8n) sem o agente responder duas vezes
+    if (process.env.WAHA_SESSION && payload.session && payload.session !== process.env.WAHA_SESSION) return;
+
     const naoECliente = (id) => /(@broadcast|@g\.us|@newsletter)$/.test(String(id));
 
     // 1. Mensagens que SAÍRAM do número da Bubble Box
@@ -592,7 +602,7 @@ app.post('/waha/webhook', async (req, res) => {
     // Comandos do dono (PAUSAR / RETOMAR / STATUS CHECKIN), vindos do WhatsApp do Rafael
     const comando = comandoCheckin(messageBody);
     if (comando && await ehODono(clientId)) {
-      await enviarWhatsApp(clientId, await controlarCheckin(comando));
+      await enviarWhatsApp(clientId, await controlarCheckin(comando), { ignorarControle: true });
       return;
     }
 
@@ -606,6 +616,7 @@ app.post('/waha/webhook', async (req, res) => {
     // com o agente, avisa que ele só lê texto
     if (hasMedia && !messageBody) {
       const conversa = await getOrCreateConversation(clientId);
+      if (conversa) await sincronizarComPainel(conversa, clientId);
       if (conversa && conversa.status === 'humano') {
         await saveMessage(conversa.id, 'user', `[cliente enviou ${p.type || 'mídia'}]`);
         await touchConversation(conversa.id);
@@ -706,9 +717,11 @@ async function processarFila(clientId) {
 async function responderCliente(clientId, texto) {
   try {
     const reply = await chat(clientId, texto);
+    // Despedida de uma transferência feita agora: sai mesmo com a conversa já com a equipe
+    const transferiu = transferidasAgora.delete(clientId);
     // Se a resposta for null, o Rafael está no controle
     if (reply) {
-      await enviarWhatsApp(clientId, reply);
+      await enviarWhatsApp(clientId, reply, { ignorarControle: transferiu });
       console.log(`[WAHA] Reply sent to ${clientId}`);
     }
   } catch (chatErr) {
@@ -784,17 +797,69 @@ function foiOAgente(texto) {
   return !!expira && expira > Date.now();
 }
 
-async function enviarWhatsApp(chatId, text) {
+async function enviarWhatsApp(chatId, text, { ignorarControle = false } = {}) {
   text = String(text).replace(/\*\*(.+?)\*\*/g, '*$1*'); // negrito do WhatsApp é com 1 asterisco
   const agora = Date.now();
   for (const [k, expira] of enviadasPeloAgente) if (expira < agora) enviadasPeloAgente.delete(k);
   enviadasPeloAgente.set(chaveTexto(text), agora + 10 * 60 * 1000);
+
+  // Com o painel: ele grava a mensagem como "Agente" e envia pelo WAHA dele
+  if (PAINEL_URL) {
+    const r = await painel('POST', '', { session: sessaoWaha(), chatId, text, ignorarControle });
+    if (r.status === 409) console.log(`[Painel] ${chatId} está com a equipe — resposta do agente não enviada`);
+    else if (!r.ok) console.error(`⚠️  Painel recusou o envio (${r.status}) para ${chatId}`);
+    return r;
+  }
+
   if (!process.env.WAHA_API_URL) return console.log(`[WAHA Simulado] para ${chatId}: ${text}`);
   return fetch(`${process.env.WAHA_API_URL}/api/sendText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' },
-    body: JSON.stringify({ session: process.env.WAHA_SESSION || 'default', chatId, text }),
+    body: JSON.stringify({ session: sessaoWaha(), chatId, text }),
   });
+}
+
+// ==========================================
+// PAINEL DE ATENDIMENTO (Capitalcon)
+// ==========================================
+// O número da Bubble Box é atendido no painel da equipe. O painel é quem decide se a conversa
+// está com o agente ou com a equipe (botões Assumir / Devolver ao agente, resposta pelo
+// celular, frase de devolução). Antes de responder, o agente pergunta ao painel.
+const PAINEL_URL = (process.env.PAINEL_URL || '').replace(/\/$/, '');
+const transferidasAgora = new Set(); // clientId: transferiu nesta rodada (a despedida ainda sai)
+const sessaoWaha = () => process.env.WAHA_SESSION || 'default';
+
+async function painel(method, query, body) {
+  try {
+    const r = await fetch(`${PAINEL_URL}/api/agente${query}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'x-agente-token': process.env.PAINEL_AGENTE_TOKEN || '' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { ok: r.ok, status: r.status, dados: await r.json().catch(() => ({})) };
+  } catch (err) {
+    console.error('⚠️  Painel fora do ar:', err.message);
+    return { ok: false, status: 0, dados: {} };
+  }
+}
+
+// Agente transfere (humano) ou retoma (agente) a conversa no painel
+async function painelControle(clientId, controller, motivo) {
+  if (!PAINEL_URL) return;
+  const r = await painel('PATCH', '', { session: sessaoWaha(), chatId: clientId, controller, motivo });
+  if (!r.ok) console.error(`⚠️  Não consegui avisar o painel (${r.status}) sobre ${clientId}`);
+}
+
+// Copia para a memória do agente quem está atendendo segundo o painel
+async function sincronizarComPainel(conversa, clientId) {
+  if (!PAINEL_URL) return;
+  const q = `?session=${encodeURIComponent(sessaoWaha())}&chatId=${encodeURIComponent(clientId)}`;
+  const r = await painel('GET', q);
+  const controller = r.dados && r.dados.controller;
+  if (!r.ok || !['agente', 'humano'].includes(controller) || controller === conversa.status) return;
+  conversa.status = controller;
+  await supabase.from('conversas').update({ status: controller, updated_at: new Date().toISOString() }).eq('id', conversa.id);
+  console.log(`[Painel] ${clientId} agora com ${controller === 'agente' ? 'o agente' : 'a equipe'}`);
 }
 
 // ==========================================
@@ -815,7 +880,7 @@ app.post('/checkin', async (req, res) => {
     return res.status(400).json({ enviado: false, motivo: 'telefone ou mensagem inválidos' });
   }
   const numero = digitos.startsWith('55') && digitos.length >= 12 ? digitos : `55${digitos}`;
-  const sessao = process.env.WAHA_SESSION || 'default';
+  const sessao = sessaoWaha();
   const headers = { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Api-Key': process.env.WAHA_API_KEY || '' };
 
   try {
@@ -825,10 +890,11 @@ app.post('/checkin', async (req, res) => {
 
     const conversa = await getOrCreateConversation(contato.chatId);
     if (!conversa) return res.status(500).json({ enviado: false, motivo: 'não consegui abrir a conversa' });
+    await sincronizarComPainel(conversa, contato.chatId);
     if (conversa.status === 'humano') return res.json({ enviado: false, motivo: 'cliente em atendimento humano' });
 
     const envio = await enviarWhatsApp(contato.chatId, mensagem);
-    if (!envio.ok) return res.status(502).json({ enviado: false, motivo: `WAHA recusou o envio (${envio.status})` });
+    if (!envio.ok) return res.status(502).json({ enviado: false, motivo: `${PAINEL_URL ? 'Painel' : 'WAHA'} recusou o envio (${envio.status})` });
 
     await saveMessage(conversa.id, 'assistant', mensagem);
     console.log(`📨 Check-in de primeiro ciclo enviado para ${contato.chatId}`);
@@ -841,7 +907,7 @@ app.post('/checkin', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', agent: 'Super Bubble', versao: VERSAO, modelo: AI_MODEL, timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', agent: 'Super Bubble', versao: VERSAO, modelo: AI_MODEL, painel: !!PAINEL_URL, sessao: sessaoWaha(), timestamp: new Date().toISOString() });
 });
 
 // ==========================================
@@ -861,5 +927,6 @@ app.listen(PORT, () => {
   console.log(`💾 Supabase: ${process.env.SUPABASE_URL ? 'conectado' : '⚠️  não configurado'}`);
   console.log(`🏭 VMLav: ${VMLAV_KEY ? 'conectado' : '⚠️  não configurado'}`);
   console.log(`📲 Notificação: ${process.env.WAHA_API_URL ? 'WAHA conectado' : 'log local (WAHA não configurado)'}`);
+  console.log(`🗂️  Painel: ${PAINEL_URL ? `${PAINEL_URL} (sessão ${sessaoWaha()})` : 'não configurado — envia direto pelo WAHA'}`);
   console.log('');
 });
