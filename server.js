@@ -26,7 +26,7 @@ const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4';
 // Sonnet 5 pensa antes de responder por padrão: custa mais, demora mais e pode estourar o
 // max_tokens (resposta cortada). Atendimento de lavanderia não precisa disso — desligado.
 const AI_EXTRA = AI_MODEL.includes('sonnet-5') ? { reasoning: { enabled: false } } : {};
-const VERSAO = '2026-10-01-painel';
+const VERSAO = '2026-10-10-fechamento';
 
 // Supabase (memória)
 const supabase = createClient(
@@ -905,9 +905,34 @@ app.post('/checkin', async (req, res) => {
   }
 });
 
+// ==========================================
+// AVISO DE FECHAMENTO DAS UNIDADES (a partir das 23h)
+// ==========================================
+// Regras em fechamento.js. Manda pro WhatsApp do Rafael, pelo número da Bubble Box.
+// Desliga com FECHAMENTO_ATIVO=false no Coolify.
+const { criarMonitor } = require('./fechamento');
+const FECHAMENTO_ATIVO = process.env.FECHAMENTO_ATIVO !== 'false' && !!VMLAV_KEY && !!(PAINEL_URL || process.env.WAHA_API_URL);
+const fechamento = criarMonitor({
+  vmlavKey: VMLAV_KEY,
+  enviar: (texto) => enviarWhatsApp(`${DONO_TELEFONE}@c.us`, texto, { ignorarControle: true }),
+});
+if (FECHAMENTO_ATIVO) fechamento.iniciar();
+
+// Teste manual: manda agora a situação das unidades pro Rafael (marcada como TESTE)
+app.post('/fechamento/teste', async (req, res) => {
+  if (!process.env.CHECKIN_TOKEN || req.get('x-checkin-token') !== process.env.CHECKIN_TOKEN) {
+    return res.status(401).json({ enviado: false, motivo: 'não autorizado' });
+  }
+  try {
+    res.json({ enviado: true, texto: await fechamento.previa() });
+  } catch (err) {
+    res.status(500).json({ enviado: false, motivo: err.message });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', agent: 'Super Bubble', versao: VERSAO, modelo: AI_MODEL, painel: !!PAINEL_URL, sessao: sessaoWaha(), timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', agent: 'Super Bubble', versao: VERSAO, modelo: AI_MODEL, painel: !!PAINEL_URL, sessao: sessaoWaha(), fechamento: FECHAMENTO_ATIVO, timestamp: new Date().toISOString() });
 });
 
 // ==========================================
